@@ -20,7 +20,6 @@ This is particularly useful for massively multiplayer sessions, such as 24-playe
 ## Build (optional)
 1. Download and install Visual Studio 2022.
 1. Clone the repository.
-1. Initialize submodules: `git submodule update --init --recursive`.
 1. Open in Visual Studio and build the project.
 
 ## Install
