@@ -13,6 +13,8 @@
 #include <thread>
 #include <vector>
 
+constexpr bool DEBUG = false;
+
 // Disabling this will save resources at run time but disables adapter
 // hotplugging.
 constexpr bool ENABLE_HOTPLUGGING = true;
@@ -20,7 +22,7 @@ constexpr bool ENABLE_HOTPLUGGING = true;
 // The size of our adapters array.
 // A fixed-size array is used to ensure it can be accessed in a thread-safe way
 // without locks.
-constexpr std::size_t MAX_ADAPTERS = 24;
+constexpr std::size_t MAX_ADAPTERS = 6;
 
 static bool running = true;
 BOOL WINAPI CtrlHandler(DWORD event) {
@@ -76,9 +78,9 @@ struct Controller {
     _DS4_REPORT ds4{};
 
     ds4.bThumbLX = gc.AnalogX;
-    ds4.bThumbLY = -gc.AnalogY;
+    ds4.bThumbLY = ~gc.AnalogY;
     ds4.bThumbRX = gc.CStickX;
-    ds4.bThumbRY = -gc.CStickY;
+    ds4.bThumbRY = ~gc.CStickY;
 
     ds4.wButtons = 0;
     if (gc.Start) ds4.wButtons |= DS4_BUTTON_OPTIONS;
@@ -214,6 +216,7 @@ class Adapter {
 
 // Globals.
 // The list of GameCube Adapters.
+// TODO: Make this a non-resizable vector.
 std::array<std::atomic<Adapter*>, MAX_ADAPTERS> adapters;
 
 class ViGEmClient {
@@ -290,8 +293,24 @@ class LibUSB {
       }
       if (desc.idVendor == VENDOR_ID && desc.idProduct == PRODUCT_ID) {
         libusb_device_handle* dev_handle = nullptr;
-        // If we fail to open the device.
-        if (libusb_open(device, &dev_handle) != 0 || !dev_handle) {
+        int retval = libusb_open(device, &dev_handle);
+        if (retval < 0) {
+          if (DEBUG) {
+            std::stringstream ss;
+            ss << "libusb_open failed with error code: " << retval << std::endl;
+            if (retval == LIBUSB_ERROR_ACCESS) {
+              ss << "A program (Dolphin, Yuzu, this feeder, etc.) has already "
+                    "claimed this adapter. Close it and restart the feeder."
+                 << std::endl;
+            }
+            std::cout << ss.str();
+          }
+          continue;
+        }
+        if (!dev_handle) {
+          std::stringstream ss;
+          ss << "libusb_open returned a nullptr dev_handle" << std::endl;
+          std::cout << ss.str();
           continue;
         }
         Adapter* adapterPtr = new Adapter(dev_handle);
@@ -346,9 +365,6 @@ class LibUSB {
 
 class AdapterThread {
  public:
-  AdapterThread() { SetupPads(); }
-
- private:
   void SetupPads() {
     // Set up the virtual gamepads.
     while (pads.size() / 4 < adapters.size()) {
@@ -365,7 +381,27 @@ class AdapterThread {
     }
   }
 
- public:
+  void AddDeterministic() {
+    // Set up the virtual gamepads.
+    if (pads.size() / 4 < adapters.size()) {
+      std::cout
+          << "Adding virtual gamepads. Please wait. We are throttling the "
+             "attachment rate to ensure deterministic port orderings."
+          << std::endl;
+    }
+    while (pads.size() / 4 < adapters.size()) {
+      for (size_t i = 0; i < 4; i++) {
+        pads.push_back(vigemClient.AddController());
+        std::cout << "Added controller " << pads.size() << "/"
+                  << MAX_ADAPTERS * 4 << std::endl;
+        // Delay plug-in to ensure controllers are added in the desired order.
+        if (pads.size() != adapters.size() * 4) {
+          std::this_thread::sleep_for(std::chrono::milliseconds(3000));
+        }
+      }
+    }
+  }
+
   void run() {
     while (running) {
       // Allocate new virtual pads as needed.
@@ -378,7 +414,6 @@ class AdapterThread {
         }
         Adapter::Inputs inputs;
         // If we fail to get the latest inputs, remove the lost adapter.
-        // TODO: Find a better way to detect disconnections.
         const bool gotLastInput = adapters[i].load()->GetInputs(inputs);
         if (adapters[i].load()->ShouldDisconnect(gotLastInput)) {
           LibUSB::RemoveAdapter(adapters[i]);
@@ -421,11 +456,6 @@ class AdapterThread {
           }
           DS4_REPORT report = Controller::GCtoDS4(inputs.Controllers[j]);
           vigemClient.UpdateController(pads[index], report);
-          // DEBUG
-          /*if (inputs.Controllers[j].A) {
-                          std::cout << "Detected A press on controller " <<
-          index << std::endl;
-          }*/
         }
       }
     }
@@ -445,6 +475,18 @@ class AdapterThread {
 };
 
 int main(int argc, char* argv[]) {
+  // This should ideally be enabled for the first run of the application.
+  // Subsequent runs shouldn't matter. If Windows butchers the device orderings,
+  // then grab the latest version of devcon.exe from here:
+  // https://github.com/SMarioMan/devcon/releases
+  // and run the following command as admin:
+  // devcon.exe removeall *VID_054C*
+  // Then run:
+  // GameCubeAdapterUnlimited.exe --det
+  if (argc > 1 && strcmp(argv[1], "--det") == 0) {
+    AdapterThread().AddDeterministic();
+    return 0;
+  }
   std::cout << "Input feeder started" << std::endl;
 
   // Set a handler to gracefully close on Ctrl+C.
@@ -456,16 +498,20 @@ int main(int argc, char* argv[]) {
   // Multithreading ensures that polling for new adapters doesn't stall input
   // updates.
   AdapterThread adapterThread = AdapterThread();
+  adapterThread.SetupPads();
   std::thread thread(&AdapterThread::run, &adapterThread);
 
   do {
-    // Poll for new adapter connections.
-    libUsb.PollDevices();
+    if (libUsb.NumAdapters() < MAX_ADAPTERS) {
+      // Poll for new adapter connections.
+      libUsb.PollDevices();
+    }
     // Only check for new controllers at a fixed interval.
     // This prevents busy polling from maxing out a thread.
     std::this_thread::sleep_for(std::chrono::milliseconds(5000));
   } while (running && ENABLE_HOTPLUGGING);
 
+  // Wait for the adapter thread to finish gracefully.
   thread.join();
 
   return 0;
