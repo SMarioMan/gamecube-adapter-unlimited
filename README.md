@@ -25,7 +25,7 @@ This is particularly useful for massively multiplayer sessions, such as 24-playe
 ## Install
 1. Install ViGEm Driver https://github.com/ViGEm/ViGEmBus/releases/
 1. Install the WinUSB driver using Zadig: https://dolphin-emu.org/docs/guides/how-use-official-gc-controller-adapter-wii-u/#Using_Zadig
-1. (Optional) Overclock your adapters uing the [overclocking guide](https://docs.google.com/document/d/1cQ3pbKZm_yUtcLK9ZIXyPzVbTJkvnfxKIyvuFMwzWe0/). This will imrpove the controller poll rate.
+1. (Optional) Overclock your adapters uing the [overclocking guide](https://docs.google.com/document/d/1cQ3pbKZm_yUtcLK9ZIXyPzVbTJkvnfxKIyvuFMwzWe0/). This will improve the controller poll rate.
 1. Download and extract the feeder: https://github.com/SMarioMan/gamecube-adapter-unlimited/releases
 
 ## Run
