@@ -37,7 +37,17 @@ BOOL WINAPI CtrlHandler(DWORD event) {
 struct Controller {
 #pragma pack(push, 1)
   struct GCInput {
-    unsigned char On;
+    union {
+      unsigned char Status;
+      struct {
+        unsigned char _pad : 1;
+        // This bit is set when the grey USB cable is attached, to power rumble.
+        unsigned char CanRumble : 1;
+        unsigned char _pad2 : 2;
+        unsigned char Wired : 1;
+        unsigned char Wireless : 1;
+      };
+    };
     union {
       unsigned short Buttons;
       struct {
@@ -63,7 +73,7 @@ struct Controller {
     unsigned char RightTrigger;
 
     GCInput()
-        : On(false),
+        : Status(0),
           Buttons(0),
           AnalogX(128),
           AnalogY(128),
@@ -71,6 +81,7 @@ struct Controller {
           CStickY(128),
           LeftTrigger(0),
           RightTrigger(0){};
+    bool On() { return Wired || Wireless; }
   };
 #pragma pack(pop)
 
@@ -123,6 +134,7 @@ class Adapter {
   static const unsigned char WriteEndpoint = 2 | LIBUSB_ENDPOINT_OUT;
 
   libusb_device_handle* dev_handle;
+  std::array<unsigned char, 5> rumblePayload;
 
   size_t failedReads = 0;
 
@@ -136,6 +148,11 @@ class Adapter {
                 << std::endl;
     }
     return interrupt == LIBUSB_SUCCESS && length == actual;
+  }
+  bool WriteRumble() {
+    unsigned char* data = rumblePayload.data();
+    const int length = static_cast<int>(rumblePayload.size());
+    return Write(data, length);
   }
 
  public:
@@ -165,11 +182,9 @@ class Adapter {
     // Inputs can be read by the read endpoint.
     unsigned char init = 0x13;
     Write(&init, 1);
-    // Rumble payload.
-    // Disable rumble on all controllers.
-    // Likely nonessential.
-    unsigned char rumble[]{0x11, 0x0, 0x0, 0x0, 0x0};
-    Write(rumble, sizeof(rumble));
+
+    // Rumble should default to off.
+    ResetRumble();
   }
   ~Adapter() {
     const int release = libusb_release_interface(dev_handle, 0);
@@ -212,17 +227,51 @@ class Adapter {
     }
     return false;
   }
+  bool ResetRumble() {
+    rumblePayload = {0x11, 0x0, 0x0, 0x0, 0x0};
+    return WriteRumble();
+  }
+  bool SetRumble(ssize_t index, unsigned char val) {
+    if (index < 0 || index >= 4) {
+      std::cout << "Rumble index out of range: " << index << std::endl;
+      return false;
+    }
+
+    // NOTE: Rumble should probably be disabled in the following circumstances,
+    // but it seems to not matter, so we ignore it for now:
+    // The controller is wireless. WaveBirds do not have rumble functionality.
+    // The grey USB cable is disconnected. Without it, there isn't enough power
+    // for the motors.
+    // The controller is disconnected. Rumble for detached controllers is
+    // pointless.
+
+    rumblePayload[1 + index] = val;
+
+    if (DEBUG) {
+      std::cout << "Rumble payload: ";
+      for (const auto& val : rumblePayload) {
+        std::cout << "0x" << std::hex << static_cast<int>(val) << ", ";
+      }
+      std::cout << std::endl;
+    }
+
+    return WriteRumble();
+  }
 };
 
 // Globals.
 // The list of GameCube Adapters.
-// TODO: Make this a non-resizable vector.
 std::array<std::atomic<Adapter*>, MAX_ADAPTERS> adapters;
 
+// Forward declaration.
+_Function_class_(EVT_VIGEM_DS4_NOTIFICATION) VOID
+    UpdateRumble(PVIGEM_CLIENT Client, PVIGEM_TARGET Target, UCHAR LargeMotor,
+                 UCHAR SmallMotor, DS4_LIGHTBAR_COLOR LightbarColor);
+
 class ViGEmClient {
+ public:
   PVIGEM_CLIENT client;
 
- public:
   ViGEmClient() {
     client = vigem_alloc();
     if (!client) {
@@ -244,16 +293,25 @@ class ViGEmClient {
     // Allocate handle to identify new pad.
     const PVIGEM_TARGET pad = vigem_target_ds4_alloc();
     // Add client to the bus, this equals a plug-in event.
-    const VIGEM_ERROR pir = vigem_target_add(client, pad);
-    if (!VIGEM_SUCCESS(pir)) {
+    const VIGEM_ERROR add_err = vigem_target_add(client, pad);
+    if (!VIGEM_SUCCESS(add_err)) {
       std::stringstream ss;
-      ss << "vigem_target_add failed with error code: 0x" << std::hex << pir
+      ss << "vigem_target_add failed with error code: 0x" << std::hex << add_err
          << std::endl;
+      throw std::runtime_error(ss.str());
+    }
+    const VIGEM_ERROR reg_err =
+        vigem_target_ds4_register_notification(client, pad, &UpdateRumble);
+    if (!VIGEM_SUCCESS(reg_err)) {
+      std::stringstream ss;
+      ss << "vigem_target_ds4_register_notification failed with error code: 0x"
+         << std::hex << add_err << std::endl;
       throw std::runtime_error(ss.str());
     }
     return pad;
   }
   void RemoveController(PVIGEM_TARGET& pad) {
+    vigem_target_ds4_unregister_notification(pad);
     vigem_target_remove(client, pad);
     vigem_target_free(pad);
     pad = nullptr;
@@ -402,6 +460,15 @@ class AdapterThread {
     }
   }
 
+  size_t GetPadIndex(PVIGEM_TARGET pad) {
+    auto it = find(pads.begin(), pads.end(), pad);
+    if (it != pads.end()) {
+      return distance(pads.begin(), it);
+    } else {
+      return SIZE_MAX;
+    }
+  }
+
   void run() {
     while (running) {
       // Allocate new virtual pads as needed.
@@ -419,7 +486,7 @@ class AdapterThread {
           LibUSB::RemoveAdapter(adapters[i]);
           std::cout << "Adapter " << i << " disconnected" << std::endl;
           // Associated pads are marked as disconnected.
-          // NOTE: This assumes inputs.Controllers[j].On remains true.
+          // NOTE: This assumes inputs.Controllers[j].On() remains true.
           for (size_t j = 0; j < 4; j++) {
             size_t index = i * 4 + j;
             isConnected[index] = false;
@@ -434,10 +501,14 @@ class AdapterThread {
         for (size_t j = 0; j < 4; j++) {
           const size_t index = i * 4 + j;
           // Check for a connection change.
-          if (isConnected[index] != (bool)inputs.Controllers[j].On) {
-            isConnected[index] = (bool)inputs.Controllers[j].On;
+          if (isConnected[index] != (bool)inputs.Controllers[j].On()) {
+            isConnected[index] = (bool)inputs.Controllers[j].On();
             if (isConnected[index]) {
-              std::cout << "Controller " << index << " connected" << std::endl;
+              std::cout << "Controller " << index << " connected";
+              if (inputs.Controllers[j].Wired)
+                std::cout << " (wired)" << std::endl;
+              if (inputs.Controllers[j].Wireless)
+                std::cout << " (wireless)" << std::endl;
             } else {
               // Disconnected controllers are reset.
               const Controller::GCInput resetGCInput;
@@ -447,7 +518,7 @@ class AdapterThread {
                         << std::endl;
             }
           }
-          if (!inputs.Controllers[j].On) {
+          if (!inputs.Controllers[j].On()) {
             continue;
           }
           if (pads.size() < index) {
@@ -474,6 +545,33 @@ class AdapterThread {
   std::vector<bool> isConnected;
 };
 
+// Global adapter thread.
+// Must be global to allow UpdateRumble() to access required fields.
+AdapterThread adapterThread = AdapterThread();
+
+_Function_class_(EVT_VIGEM_DS4_NOTIFICATION) VOID
+    UpdateRumble(PVIGEM_CLIENT Client, PVIGEM_TARGET Target, UCHAR LargeMotor,
+                 UCHAR SmallMotor, DS4_LIGHTBAR_COLOR LightbarColor) {
+  if (Client != adapterThread.vigemClient.client) {
+    std::stringstream ss;
+    ss << "VIGEM_DS4_NOTIFICATION failed: "
+       << "client did not match." << std::endl;
+    throw std::runtime_error(ss.str());
+  }
+  // Identify the target controller.
+  size_t index = adapterThread.GetPadIndex(Target);
+  if (index == SIZE_MAX) {
+    std::stringstream ss;
+    ss << "Could not find the requested vigemClient gamepad." << std::endl;
+    throw std::runtime_error(ss.str());
+  }
+  Adapter* adapter = adapters[index / 4].load();
+  if (adapter) {
+    bool motor = SmallMotor || LargeMotor;
+    adapter->SetRumble(index % 4, motor);
+  }
+}
+
 int main(int argc, char* argv[]) {
   // This should ideally be enabled for the first run of the application.
   // Subsequent runs shouldn't matter. If Windows butchers the device orderings,
@@ -484,7 +582,7 @@ int main(int argc, char* argv[]) {
   // Then run:
   // GameCubeAdapterUnlimited.exe --det
   if (argc > 1 && strcmp(argv[1], "--det") == 0) {
-    AdapterThread().AddDeterministic();
+    adapterThread.AddDeterministic();
     return 0;
   }
   std::cout << "Input feeder started" << std::endl;
@@ -497,7 +595,6 @@ int main(int argc, char* argv[]) {
   // Start the adapter thread to update inputs.
   // Multithreading ensures that polling for new adapters doesn't stall input
   // updates.
-  AdapterThread adapterThread = AdapterThread();
   adapterThread.SetupPads();
   std::thread thread(&AdapterThread::run, &adapterThread);
 
