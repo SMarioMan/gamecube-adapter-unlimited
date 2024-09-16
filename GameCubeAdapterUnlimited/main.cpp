@@ -5,6 +5,7 @@
 
 #include <array>
 #include <atomic>
+#include <bitset>
 #include <chrono>
 #include <iostream>
 #include <sstream>
@@ -20,6 +21,7 @@ constexpr bool DEBUG = false;
 constexpr bool ENABLE_HOTPLUGGING = true;
 
 // The size of our adapters array.
+// Increase this to support more adapters.
 // A fixed-size array is used to ensure it can be accessed in a thread-safe way
 // without locks.
 constexpr std::size_t MAX_ADAPTERS = 6;
@@ -38,12 +40,16 @@ struct Controller {
 #pragma pack(push, 1)
   struct GCInput {
     union {
+      // Known bit layouts:
+      // 00000100: Rumble enabled
+      // 00010000: Controller
+      // 00100010: WaveBird
       unsigned char Status;
       struct {
-        unsigned char _pad : 1;
+        unsigned char _pad : 2;
         // This bit is set when the grey USB cable is attached, to power rumble.
         unsigned char CanRumble : 1;
-        unsigned char _pad2 : 2;
+        unsigned char _pad2 : 1;
         unsigned char Wired : 1;
         unsigned char Wireless : 1;
       };
@@ -80,7 +86,9 @@ struct Controller {
           CStickX(128),
           CStickY(128),
           LeftTrigger(0),
-          RightTrigger(0){};
+          RightTrigger(0) {};
+    // NOTE: This will break if we discover that other bits are set with certain
+    // specialized controllers.
     bool On() { return Wired || Wireless; }
   };
 #pragma pack(pop)
@@ -357,8 +365,9 @@ class LibUSB {
             std::stringstream ss;
             ss << "libusb_open failed with error code: " << retval << std::endl;
             if (retval == LIBUSB_ERROR_ACCESS) {
-              ss << "A program (Dolphin, Yuzu, this feeder, etc.) has already "
-                    "claimed this adapter. Close it and restart the feeder."
+              ss << "A program (Dolphin, Yuzu, another feeder, etc.) has "
+                    "already claimed this adapter. Close it, then restart the "
+                    "feeder."
                  << std::endl;
             }
             std::cout << ss.str();
@@ -505,10 +514,14 @@ class AdapterThread {
             isConnected[index] = (bool)inputs.Controllers[j].On();
             if (isConnected[index]) {
               std::cout << "Controller " << index << " connected";
-              if (inputs.Controllers[j].Wired)
-                std::cout << " (wired)" << std::endl;
-              if (inputs.Controllers[j].Wireless)
-                std::cout << " (wireless)" << std::endl;
+              if (inputs.Controllers[j].Wired) std::cout << " (wired)";
+              if (inputs.Controllers[j].Wireless) std::cout << " (wireless)";
+              if (DEBUG) {
+                std::cout << " ("
+                          << std::bitset<8>(inputs.Controllers[j].Status)
+                          << ")";
+              }
+              std::cout << std::endl;
             } else {
               // Disconnected controllers are reset.
               const Controller::GCInput resetGCInput;
