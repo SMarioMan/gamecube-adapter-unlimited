@@ -40,18 +40,25 @@ struct Controller {
 #pragma pack(push, 1)
   struct GCInput {
     union {
-      // Known bit layouts:
-      // 00000100: Rumble enabled
-      // 00010000: Controller
-      // 00100010: WaveBird
+      // Status bits layout: https://hitmen.c02.at/files/yagcd/yagcd/chap9.html
       unsigned char Status;
       struct {
-        unsigned char _pad : 2;
+        // Wireless (1: wireless Controller)
+        unsigned char Wireless : 1;
+        // Wireless receive (0: not wireless 1: wireless)
+        unsigned char WirelessReceive : 1;
         // This bit is set when the grey USB cable is attached, to power rumble.
         unsigned char CanRumble : 1;
-        unsigned char _pad2 : 1;
-        unsigned char Wired : 1;
-        unsigned char Wireless : 1;
+        // Seemingly always 0.
+        unsigned char _pad : 1;
+        // Controller type (0: N64, 1: GameCube)
+        unsigned char Console : 1;
+        // Wireless type (0:IF 1:RF)
+        unsigned char WirelessType : 1;
+        // Wireless state (0: variable 1: fixed)
+        unsigned char WirelessState : 1;
+        // 0: Non-standard controller, 1: Standard GameCube controller
+        unsigned char Standard : 1;
       };
     };
     union {
@@ -87,9 +94,8 @@ struct Controller {
           CStickY(128),
           LeftTrigger(0),
           RightTrigger(0) {};
-    // NOTE: This will break if we discover that other bits are set with certain
-    // specialized controllers.
-    bool On() { return Wired || Wireless; }
+    // NOTE: This bit is always 1 when a GameCube controller is attached.
+    bool On() { return Console; }
   };
 #pragma pack(pop)
 
@@ -239,6 +245,11 @@ class Adapter {
     rumblePayload = {0x11, 0x0, 0x0, 0x0, 0x0};
     return WriteRumble();
   }
+  // index: The controller port to assign the rumble value to.
+  // val: the rumble state to use. The following rumble bits are supported:
+  // 0b00000001: Enable rumble.
+  // 0b00000010: Enable motor braking.
+  // Both can (but should not) be used at the same time.
   bool SetRumble(ssize_t index, unsigned char val) {
     if (index < 0 || index >= 4) {
       std::cout << "Rumble index out of range: " << index << std::endl;
@@ -509,17 +520,32 @@ class AdapterThread {
         // Update the inputs of each virtual gamepad.
         for (size_t j = 0; j < 4; j++) {
           const size_t index = i * 4 + j;
+          Controller::GCInput& input = inputs.Controllers[j];
           // Check for a connection change.
-          if (isConnected[index] != (bool)inputs.Controllers[j].On()) {
-            isConnected[index] = (bool)inputs.Controllers[j].On();
+          if (isConnected[index] != (bool)input.On()) {
+            isConnected[index] = (bool)input.On();
             if (isConnected[index]) {
               std::cout << "Controller " << index << " connected";
-              if (inputs.Controllers[j].Wired) std::cout << " (wired)";
-              if (inputs.Controllers[j].Wireless) std::cout << " (wireless)";
               if (DEBUG) {
-                std::cout << " ("
-                          << std::bitset<8>(inputs.Controllers[j].Status)
-                          << ")";
+                std::cout << " (" << std::bitset<8>(input.Status) << ")"
+                          << std::endl
+                          << "Wireless: "
+                          << (input.Wireless ? "Wireless" : "Wired")
+                          << std::endl
+                          << "Wireless Receive: "
+                          << (input.WirelessReceive ? "Yes" : "No") << std::endl
+                          << "Can Rumble: " << (input.CanRumble ? "Yes" : "No")
+                          << std::endl
+                          << "Console: " << (input.Console ? "GameCube" : "N64")
+                          << std::endl
+                          << "Wireless Type: "
+                          << (input.WirelessType ? "RF" : "IF") << std::endl
+                          << "Wireless State: "
+                          << (input.WirelessState ? "Fixed" : "Variable")
+                          << std::endl
+                          << "Standard: "
+                          << (input.Standard ? "Standard" : "Non-standard")
+                          << std::endl;
               }
               std::cout << std::endl;
             } else {
@@ -531,14 +557,14 @@ class AdapterThread {
                         << std::endl;
             }
           }
-          if (!inputs.Controllers[j].On()) {
+          if (!input.On()) {
             continue;
           }
           if (pads.size() < index) {
             throw std::out_of_range(
                 "Not enough virtual pads allocated to handle adapter inputs.");
           }
-          DS4_REPORT report = Controller::GCtoDS4(inputs.Controllers[j]);
+          DS4_REPORT report = Controller::GCtoDS4(input);
           vigemClient.UpdateController(pads[index], report);
         }
       }
