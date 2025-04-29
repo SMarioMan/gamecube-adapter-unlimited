@@ -324,7 +324,7 @@ class ViGEmClient {
     if (!VIGEM_SUCCESS(reg_err)) {
       std::stringstream ss;
       ss << "vigem_target_ds4_register_notification failed with error code: 0x"
-         << std::hex << add_err << std::endl;
+         << std::hex << reg_err << std::endl;
       throw std::runtime_error(ss.str());
     }
     return pad;
