@@ -4,10 +4,10 @@ GameCube Adapter Feeder via ViGEm, with support for unlimited adapters
 
 This feeder uses ViGEm to present GameCube controllers as DualShock 4 controllers in Windows.
 Unlike the alternatives, which are usually limited to a single adapter, this tool supports unlimited adapters, or at least up to the USB spec limit.
-This is particularly useful for massively multiplayer sessions, such as 24-player Mario Kart Wii splitscreen:
+This is particularly useful for massively multiplayer sessions, such as Mario Kart splitscreen:
 
-[![Insane 24-Player Mario Kart Wii Split Screen Test!
-](https://img.youtube.com/vi/LgkHVOwAPvo/0.jpg)](https://youtu.be/LgkHVOwAPvo)
+[![Mario Kart DS 8 Player Splitscreen Multiplayer [4K 60FPS]!
+](https://img.youtube.com/vi/6uR6WGDYfug/0.jpg)](https://youtu.be/6uR6WGDYfug)
 
 ## Features
 * An unlimited number of controllers and adapters can be used at once, for local massively multiplayer sessions.

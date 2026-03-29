@@ -14,17 +14,13 @@
 #include <thread>
 #include <vector>
 
+#include "removeall.hpp"
+
+class AdapterThread;
+
 constexpr bool DEBUG = false;
 
-// Disabling this will save resources at run time but disables adapter
-// hotplugging.
-constexpr bool ENABLE_HOTPLUGGING = true;
-
-// The size of our adapters array.
-// Increase this to support more adapters.
-// A fixed-size array is used to ensure it can be accessed in a thread-safe way
-// without locks.
-constexpr std::size_t MAX_ADAPTERS = 6;
+static AdapterThread* adapterThreadContext = nullptr;
 
 static bool running = true;
 BOOL WINAPI CtrlHandler(DWORD event) {
@@ -212,7 +208,7 @@ class Adapter {
   }
   bool DoesHandleMatch(Adapter* adapter) {
     if (!adapter) {
-      std::cout << "Requested DoesHandleMatch on nullptr adapter" << std::endl;
+      std::cout << "Requested DoesHandleMatch on null adapter" << std::endl;
       return false;
     }
     return DoesHandleMatch(adapter->dev_handle);
@@ -278,9 +274,66 @@ class Adapter {
   }
 };
 
-// Globals.
-// The list of GameCube Adapters.
-std::array<std::atomic<Adapter*>, MAX_ADAPTERS> adapters;
+class AdapterManager {
+ public:
+  using AdapterList = std::vector<std::shared_ptr<Adapter>>;
+
+ private:
+  static inline std::atomic<std::shared_ptr<const AdapterList>> g_adapters{
+      std::make_shared<const AdapterList>()};
+
+ public:
+  static std::shared_ptr<const AdapterList> AcquireRead() {
+    return g_adapters.load(std::memory_order_acquire);
+  }
+
+  static void AddAdapter(std::shared_ptr<Adapter> newAdapter) {
+    auto old_list = g_adapters.load(std::memory_order_acquire);
+    std::shared_ptr<AdapterList> new_list;
+    size_t index;
+    do {
+      new_list = std::make_shared<AdapterList>(*old_list);
+      // Look for an existing empty stub (nullptr) to reuse.
+      auto it = std::find(new_list->begin(), new_list->end(), nullptr);
+      if (it != new_list->end()) {
+        // Fill the stub.
+        *it = newAdapter;
+        index = std::distance(new_list->begin(), it);
+      } else {
+        // No stubs found, append to the end.
+        new_list->push_back(newAdapter);
+        index = new_list->size() - 1;
+      }
+    } while (!g_adapters.compare_exchange_weak(old_list, new_list,
+                                               std::memory_order_acq_rel,
+                                               std::memory_order_acquire));
+    std::cout << "Adapter " << index + 1 << " connected" << std::endl;
+  }
+
+  static void RemoveAdapter(Adapter* target_raw_ptr) {
+    auto old_list = g_adapters.load(std::memory_order_acquire);
+    std::shared_ptr<AdapterList> new_list;
+    size_t index;
+    do {
+      new_list = std::make_shared<AdapterList>(*old_list);
+      bool found = false;
+      // Find the adapter by raw pointer and replace it with a stub.
+      for (size_t i = 0; i < new_list->size(); i++) {
+        if ((*new_list)[i] && (*new_list)[i].get() == target_raw_ptr) {
+          (*new_list)[i] = nullptr;
+          index = i;
+          found = true;
+          break;
+        }
+      }
+      // Already removed or not found.
+      if (!found) return;
+    } while (!g_adapters.compare_exchange_weak(old_list, new_list,
+                                               std::memory_order_acq_rel,
+                                               std::memory_order_acquire));
+    std::cout << "Adapter " << index + 1 << " disconnected" << std::endl;
+  }
+};
 
 // Forward declaration.
 _Function_class_(EVT_VIGEM_DS4_NOTIFICATION) VOID
@@ -359,7 +412,7 @@ class LibUSB {
   void PollDevices() {
     libusb_device** list;
     // Hotplugging in Windows with libusb can only be done by getting the entire
-    // device list.
+    // device list, which is slow and should be done only infrequently.
     ssize_t num_devices = libusb_get_device_list(context, &list);
     for (ssize_t i = 0; i < num_devices; i++) {
       libusb_device* device = list[i];
@@ -391,61 +444,28 @@ class LibUSB {
           std::cout << ss.str();
           continue;
         }
-        Adapter* adapterPtr = new Adapter(dev_handle);
-        AddAdapter(adapterPtr);
+        std::shared_ptr<Adapter> adapterPtr =
+            std::make_shared<Adapter>(dev_handle);
+        AdapterManager::AddAdapter(adapterPtr);
       }
     }
     libusb_free_device_list(list, 1);
   }
-  // Assign an adapter to the lowest available index.
-  static void AddAdapter(Adapter* adapterPtr) {
-    size_t idx = -1;
-    // Find the next free spot to load an adapter into.
-    const auto it = std::find(adapters.begin(), adapters.end(), nullptr);
-    if (it != adapters.end()) {
-      *it = adapterPtr;
-      idx = std::distance(adapters.begin(), it);
-      std::cout << "Adapter " << idx << " connected." << std::endl;
-    }
-    // No spot found.
-    else {
-      throw std::runtime_error(
-          "No free spots left in adapters array. Please increase MAX_ADAPTERS "
-          "and recompile.");
-    }
-    return;
-  }
-  static void RemoveAdapter(Adapter* adapterPtr) {
-    // Find the associated adapter and deallocate it.
-    for (std::atomic<Adapter*>& adapter : adapters) {
-      if (!adapter.load()) {
-        continue;
-      }
-      if (adapter.load()->DoesHandleMatch(adapterPtr)) {
-        auto tmp = adapter.load();
-        adapter.store(nullptr);
-        delete tmp;
-        return;
-      }
-    }
-    std::cout << "Could not find target adapter for removal." << std::endl;
-  }
-  static size_t NumAdapters() {
-    size_t count = 0;
-    for (const Adapter* adapter : adapters) {
-      if (adapter) {
-        count++;
-      }
-    }
-    return count;
-  }
+  static size_t NumAdapters() { return AdapterManager::AcquireRead()->size(); }
 };
 
 class AdapterThread {
  public:
-  void SetupPads() {
+  // Take a ViGEmClient reference to share ownership.
+  AdapterThread(ViGEmClient& client) : vigemClient(client) {}
+
+  void SetupPads(
+      std::shared_ptr<const AdapterManager::AdapterList> adapters = nullptr) {
+    if (!adapters) {
+      adapters = AdapterManager::AcquireRead();
+    }
     // Set up the virtual gamepads.
-    while (pads.size() / 4 < adapters.size()) {
+    while (pads.size() / 4 < adapters->size()) {
       for (size_t i = 0; i < 4; i++) {
         pads.push_back(vigemClient.AddController());
         // Initialize the inputs to nothing.
@@ -459,31 +479,10 @@ class AdapterThread {
     }
   }
 
-  void AddDeterministic() {
-    // Set up the virtual gamepads.
-    if (pads.size() / 4 < adapters.size()) {
-      std::cout
-          << "Adding virtual gamepads. Please wait. We are throttling the "
-             "attachment rate to ensure deterministic port orderings."
-          << std::endl;
-    }
-    while (pads.size() / 4 < adapters.size()) {
-      for (size_t i = 0; i < 4; i++) {
-        pads.push_back(vigemClient.AddController());
-        std::cout << "Added controller " << pads.size() << "/"
-                  << MAX_ADAPTERS * 4 << std::endl;
-        // Delay plug-in to ensure controllers are added in the desired order.
-        if (pads.size() != adapters.size() * 4) {
-          std::this_thread::sleep_for(std::chrono::milliseconds(3000));
-        }
-      }
-    }
-  }
-
   size_t GetPadIndex(PVIGEM_TARGET pad) {
-    auto it = find(pads.begin(), pads.end(), pad);
+    auto it = std::find(pads.begin(), pads.end(), pad);
     if (it != pads.end()) {
-      return distance(pads.begin(), it);
+      return std::distance(pads.begin(), it);
     } else {
       return SIZE_MAX;
     }
@@ -491,20 +490,24 @@ class AdapterThread {
 
   void run() {
     while (running) {
+      // Grab a thread-safe snapshot of the array.
+      std::shared_ptr<const AdapterManager::AdapterList> adapters =
+          AdapterManager::AcquireRead();
       // Allocate new virtual pads as needed.
-      SetupPads();
+      SetupPads(adapters);
+
       // Read inputs and update virtual gamepads.
-      for (size_t i = 0; i < adapters.size(); i++) {
+      for (size_t i = 0; i < adapters->size(); i++) {
+        Adapter* currentAdapter = (*adapters)[i].get();
         // Missing adapters are skipped.
-        if (!adapters[i]) {
+        if (!currentAdapter) {
           continue;
         }
         Adapter::Inputs inputs;
         // If we fail to get the latest inputs, remove the lost adapter.
-        const bool gotLastInput = adapters[i].load()->GetInputs(inputs);
-        if (adapters[i].load()->ShouldDisconnect(gotLastInput)) {
-          LibUSB::RemoveAdapter(adapters[i]);
-          std::cout << "Adapter " << i << " disconnected" << std::endl;
+        const bool gotLastInput = currentAdapter->GetInputs(inputs);
+        if (currentAdapter->ShouldDisconnect(gotLastInput)) {
+          AdapterManager::RemoveAdapter(currentAdapter);
           // Associated pads are marked as disconnected.
           // NOTE: This assumes inputs.Controllers[j].On() remains true.
           for (size_t j = 0; j < 4; j++) {
@@ -525,7 +528,7 @@ class AdapterThread {
           if (isConnected[index] != (bool)input.On()) {
             isConnected[index] = (bool)input.On();
             if (isConnected[index]) {
-              std::cout << "Controller " << index << " connected";
+              std::cout << "Controller " << index + 1 << " connected";
               if (DEBUG) {
                 std::cout << " (" << std::bitset<8>(input.Status) << ")"
                           << std::endl
@@ -553,7 +556,7 @@ class AdapterThread {
               const Controller::GCInput resetGCInput;
               const DS4_REPORT report = Controller::GCtoDS4(resetGCInput);
               vigemClient.UpdateController(pads[index], report);
-              std::cout << "Controller " << index << " disconnected"
+              std::cout << "Controller " << index + 1 << " disconnected"
                         << std::endl;
             }
           }
@@ -576,79 +579,109 @@ class AdapterThread {
   }
   // The list of virtual gamepads.
   std::vector<PVIGEM_TARGET> pads;
-  // The ViGEmClient. Shared between adapters.
-  ViGEmClient vigemClient = ViGEmClient();
+  // The ViGEmClient reference. Shared between adapters.
+  ViGEmClient& vigemClient;
   // The controller connection state from the previous loop.
   // Used to detect connection status changes.
   // Corresponds directly to the pads vector.
   std::vector<bool> isConnected;
 };
 
-// Global adapter thread.
-// Must be global to allow UpdateRumble() to access required fields.
-AdapterThread adapterThread = AdapterThread();
-
 _Function_class_(EVT_VIGEM_DS4_NOTIFICATION) VOID
     UpdateRumble(PVIGEM_CLIENT Client, PVIGEM_TARGET Target, UCHAR LargeMotor,
                  UCHAR SmallMotor, DS4_LIGHTBAR_COLOR LightbarColor) {
-  if (Client != adapterThread.vigemClient.client) {
+  // Safely access AdapterThread via a static context pointer.
+  AdapterThread* thread = adapterThreadContext;
+  if (!thread) {
+    std::stringstream ss;
+    ss << "Missing adapterThreadContext" << std::endl;
+    throw std::runtime_error(ss.str());
+  }
+
+  if (Client != thread->vigemClient.client) {
     std::stringstream ss;
     ss << "VIGEM_DS4_NOTIFICATION failed: "
        << "client did not match." << std::endl;
     throw std::runtime_error(ss.str());
   }
   // Identify the target controller.
-  size_t index = adapterThread.GetPadIndex(Target);
+  size_t index = thread->GetPadIndex(Target);
   if (index == SIZE_MAX) {
     std::stringstream ss;
     ss << "Could not find the requested vigemClient gamepad." << std::endl;
     throw std::runtime_error(ss.str());
   }
-  Adapter* adapter = adapters[index / 4].load();
-  if (adapter) {
-    bool motor = SmallMotor || LargeMotor;
-    adapter->SetRumble(index % 4, motor);
+
+  auto adapters = AdapterManager::AcquireRead();
+  size_t adapterIndex = index / 4;
+  if (adapterIndex < adapters->size()) {
+    Adapter* adapter = (*adapters)[adapterIndex].get();
+    if (adapter) {
+      bool motor = SmallMotor || LargeMotor;
+      adapter->SetRumble(index % 4, motor);
+    }
   }
 }
 
 int main(int argc, char* argv[]) {
-  // This should ideally be enabled for the first run of the application.
-  // Subsequent runs shouldn't matter. If Windows butchers the device orderings,
-  // then grab the latest version of devcon.exe from here:
-  // https://github.com/SMarioMan/devcon/releases
-  // and run the following command as admin:
-  // devcon.exe removeall *VID_054C*
-  // Then run:
-  // GameCubeAdapterUnlimited.exe --det
-  if (argc > 1 && strcmp(argv[1], "--det") == 0) {
-    adapterThread.AddDeterministic();
-    return 0;
+  LibUSB libUsb;
+  ViGEmClient vigemClient;
+  AdapterThread adapterThread(vigemClient);
+  // Register the adapter thread context pointer.
+  adapterThreadContext = &adapterThread;
+
+  if (argc > 1) {
+    // TODO: Add a --prepopulate argument that accepts the number of adapters to
+    // pre-create as virtual controllers.
+    if (strcmp(argv[1], "--prepopulate") == 0) {
+      return 0;
+    } else {
+      std::cerr << "Usage: " << argv[0] << " [--prepopulate]" << std::endl;
+      return 1;
+    }
   }
+
+  if (IsRunningAsAdmin()) {
+    // Remove phantom DS4 devices before adding new ones, so Windows assigns
+    // ports in a deterministic order.
+    // Equivalent to: devcon.exe removeall *VID_054C*
+    LPTSTR pattern = const_cast<LPTSTR>(TEXT("*VID_054C*"));
+    int result = RemoveAll(TEXT("GameCubeAdapterUnlimited"), 1, &pattern);
+    // 0=ok, 1=reboot needed
+    if (result != 0 && result != 1) {
+      std::cerr << "RemoveAll failed with code " << result << std::endl;
+      return result;
+    }
+    if (result == 1) {
+      std::cout << "A reboot may be required to complete device removal."
+                << std::endl;
+    }
+  }
+
   std::cout << "Input feeder started" << std::endl;
 
   // Set a handler to gracefully close on Ctrl+C.
   SetConsoleCtrlHandler(CtrlHandler, TRUE);
 
-  LibUSB libUsb = LibUSB();
-
   // Start the adapter thread to update inputs.
   // Multithreading ensures that polling for new adapters doesn't stall input
   // updates.
   adapterThread.SetupPads();
-  std::thread thread(&AdapterThread::run, &adapterThread);
+  std::thread thread([&adapterThread]() { adapterThread.run(); });
 
   do {
-    if (libUsb.NumAdapters() < MAX_ADAPTERS) {
-      // Poll for new adapter connections.
-      libUsb.PollDevices();
-    }
+    libUsb.PollDevices();
     // Only check for new controllers at a fixed interval.
     // This prevents busy polling from maxing out a thread.
     std::this_thread::sleep_for(std::chrono::milliseconds(5000));
-  } while (running && ENABLE_HOTPLUGGING);
+  } while (running);
 
   // Wait for the adapter thread to finish gracefully.
-  thread.join();
+  if (thread.joinable()) {
+    thread.join();
+  }
+  // Clear context pointer before destructors.
+  adapterThreadContext = nullptr;
 
   return 0;
 }
