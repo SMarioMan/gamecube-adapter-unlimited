@@ -40,10 +40,8 @@ Ports maintain the same controller assignment and adapters fill in missing slots
 1. If a controller or adapter is disconnected, you can reattach it and port assignments should be preserved, no restart required.
 
 ## Fixing Controller Ordering
-Sometimes, Windows will change the established order of the virtual controllers. This is problematic because assigned ports may correspond to different instances than originally configured. To correct this, you must remove all of the virtual controllers from the Windows device manager, then re-add the controllers. I have developed a streamlined technique to handle this.
-
-1. Download `devcon.exe` from https://github.com/SMarioMan/devcon/releases.
-If you don't feel comfortable running my pre-built binary, you can also [build it yourself, from Microsoft's source code](https://github.com/microsoft/Windows-driver-samples/tree/main/setup/devcon).
-1. Open a terminal as admin and run the following command: `devcon.exe removeall *VID_054C*`. This will remove all PS4 controllers (including the virtual controllers created by GameCube Adapter Unlimited) from the device manager.
-1. Run `GameCubeAdapterUnlimited.exe --det`. This command slowly connects each of the virtual devices in order, ensuring proper device ordering.
-1. Run `GameCubeAdapterUnlimited.exe` as per usual. Port orderings should be maintained, at least until the next reboot.
+Sometimes, Windows will change the established order of the virtual controllers.
+This is problematic because assigned ports may correspond to different instances than originally configured.
+To correct this, you must remove all of the virtual controllers from the Windows device manager, then re-add the controllers.
+To do this, simply run `GameCubeAdapterUnlimited.exe` as admin.
+From there, port orderings should be maintained, at least until the next reboot.
